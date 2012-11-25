@@ -1,81 +1,274 @@
 #include <iostream>
-#include <fstream>
 #include <vector>
-#include <string>
-#include <stdlib.h>
-#include "lzfx.h"
+#include <windows.h>
+#include <stdio.h>
 using namespace std;
 
-unsigned int compFile(const char * fn, unsigned int chunkSize) {
-    char * memblock;
-    char * memblock2;
-	unsigned int oriSize=0;
-    ifstream srcFile(fn, ios::in|ios::binary|ios::ate);
-	ofstream desFile("CompFile", ios::out|ios::binary|ios::app);
-    if(srcFile.is_open()&&desFile.is_open()) {
-		unsigned int ilen=0;
-        ifstream::pos_type totalSize=srcFile.tellg();
-		oriSize=(unsigned int)totalSize;
-		srcFile.seekg(0, ios::beg);
-		ifstream::pos_type current=srcFile.tellg();
-		while(current<totalSize) {
-			if(((unsigned int)current+chunkSize)<totalSize) {
-				ilen=chunkSize;
-				memblock=new char [ilen];
-			}
-			else {
-				ilen=(unsigned int)(totalSize-current);
-				memblock=new char [ilen];
-			}
-			current+=ilen;
-			srcFile.read(memblock, (ilen));
-        
-			unsigned int olen=ilen*2;
-			memblock2=new char [olen];
-		
-			lzfx_compress((const void*)memblock, ilen, (void*)memblock2, &olen);
-			
-		    desFile.write(memblock2, olen);
+#define THREADCOUNT 4
 
-			delete[] memblock;
-			delete[] memblock2;
+typedef unsigned int UINT;
+
+// MUTEX HANDLER
+
+HANDLE ghBufferMutex;
+
+// EVENT HANDLER
+
+HANDLE ghDispatcherEvents[THREADCOUNT], ghWorkerEvents[THREADCOUNT], ghCollectorEvent;
+pair<HANDLE, HANDLE> ghPairEvents[THREADCOUNT];
+
+// THREAD HANDLER
+
+HANDLE ghDispatcherThread, ghWorkerThreads[THREADCOUNT], ghCollectorThread;
+
+// GLOBAL RESOURCE
+
+/*std::vector< std::pair<char*, UINT> >*/UINT buffer=0;
+
+// PROTOTYPE
+
+DWORD WINAPI DispatcherThreadProc(LPVOID);
+DWORD WINAPI WorkerThreadProc(LPVOID);
+DWORD WINAPI CollectorThreadProc(LPVOID);
+
+void CreateMutexAndEvents(void) {
+	int i;
+
+	ghBufferMutex=CreateMutex(
+		NULL,
+		FALSE,
+		NULL);
+
+	if(ghBufferMutex==NULL) {
+		printf("CreateMutex failed (%d)\n", GetLastError());
+		return ;
+	}
+
+	for(i=0; i<THREADCOUNT; i++) {
+		ghDispatcherEvents[i]=CreateEvent(
+			NULL,
+			FALSE,
+			FALSE,
+			NULL);
+		if(ghDispatcherEvents[i]==NULL) {
+			printf("CreateEvent: Dispatcher%d failed (%d)\n", i, GetLastError());
+			return ;
 		}
-		cout<<"Compression is done!"<<endl;
-    }
-    else cout<<"Unable to open source file or create destination file during compression.\n";
-    return oriSize;
+	}
+
+	for(i=0; i<THREADCOUNT; i++) {
+		ghWorkerEvents[i]=CreateEvent(
+			NULL,
+			FALSE,
+			FALSE,
+			NULL);
+		if(ghWorkerEvents[i]==NULL) {
+			printf("CreateEvent: Worker%d failed (%d)\n", i, GetLastError());
+			return ;
+		}
+	}
+
+	for(i=0; i<THREADCOUNT; i++)
+		ghPairEvents[i]=make_pair(ghDispatcherEvents[i], ghWorkerEvents[i]);
+
+	ghCollectorEvent=CreateEvent(
+		NULL,
+		FALSE,
+		TRUE,
+		NULL);
+	if(ghCollectorEvent==NULL) {
+		printf("CreateEvent: Collector failed (%d)\n", GetLastError());
+		return ;
+	}
 }
 
-void decompFile(const char * fn, unsigned int oriSize) {
-    char * memblock;
-    char * memblock2;
-    ifstream srcFile(fn, ios::in|ios::binary|ios::ate);
-    if(srcFile.is_open()) {
-        ifstream::pos_type size=srcFile.tellg();
-        unsigned int size2=oriSize*2;
-        memblock=new char [(unsigned int)size];
-		memblock2=new char [size2];
-        srcFile.seekg(0, ios::beg);
-        srcFile.read(memblock, size);
+void CreateThreads(void) {
+	int i;
+	DWORD dwThreadId;
 
-        lzfx_decompress((const void*)memblock, (unsigned int)size, (void*)memblock2, &size2);
-        ofstream desFile("output", ios::out|ios::binary);
-        if(desFile.is_open())
-            desFile.write(memblock2, size2);
-        else
-            cout<<"Unable to create destination file during decompression.\n";
-		delete[] memblock;
-		delete[] memblock2;
-		cout<<"Decompression is done!"<<endl;
-    }
-    else cout<<"Unable to open source file during decompression.\n";
-    return;
+	ghDispatcherThread=CreateThread(
+		NULL,
+		0,
+		DispatcherThreadProc,
+		NULL,
+		0,
+		&dwThreadId);
+
+	if(ghDispatcherThread==NULL) {
+		printf("CreateThread: Dispatcher failed (%d)\n", GetLastError());
+		return ;
+	}
+
+	for(i=0; i<THREADCOUNT; i++) {
+		ghWorkerThreads[i]=CreateThread(
+			NULL,
+			0,
+			WorkerThreadProc,
+			&ghPairEvents[i],
+			0,
+			&dwThreadId);
+
+		if(ghWorkerThreads[i]==NULL) {
+			printf("CreateThread: Worker%d failed (%d)\n", i, GetLastError());
+			return ;
+		}
+	}
+
+	ghCollectorThread=CreateThread(
+		NULL,
+		0,
+		CollectorThreadProc,
+		NULL,
+		0,
+		&dwThreadId);
+
+	if(ghCollectorThread==NULL) {
+		printf("CreateThread: Collector failed (%d)\n", GetLastError());
+		return ;
+	}
 }
 
-int main(int argc, char **argv) {
-	unsigned int oriSize=0, chunkSize=256;
-    oriSize=compFile("input", chunkSize*1024);
-    decompFile("CompFile", oriSize);
+void CloseEvents() {
+	int i;
+	for(i=0; i<THREADCOUNT; i++)
+		CloseHandle(ghDispatcherEvents[i]);
+	for(i=0; i<THREADCOUNT; i++)
+		CloseHandle(ghWorkerEvents[i]);
+	CloseHandle(ghCollectorEvent);
+}
+
+void WriteToBuffer(void) {
+	DWORD dwWaitResult;
+
+	dwWaitResult=WaitForSingleObject(
+		ghBufferMutex,
+		INFINITE);
+
+	switch(dwWaitResult) {
+		case WAIT_OBJECT_0:
+			printf("Dispatcher thread writing to the shared buffer...\n");
+			buffer+=4;
+			ReleaseMutex(ghBufferMutex);
+			break;
+		default:
+			printf("WaitForSingleObject failed (%d)\n", GetLastError());
+			return ;
+	}
+
+	for(int i=0; i<THREADCOUNT; i++)
+		SetEvent(ghDispatcherEvents[i]);
+
+	printf("Dispatcher thread writing to the shared buffer is complete.\n");
+}
+
+int main(void) {
+	DWORD dwWaitResult;
+
+	CreateMutexAndEvents();
+	CreateThreads();
+
+	dwWaitResult=WaitForSingleObject(
+		ghCollectorThread,
+		INFINITE);
+
+	switch(dwWaitResult) {
+		case WAIT_OBJECT_0:
+			printf("All threads ended, cleaning up for application exit...\n");
+			break;
+
+		default:
+			printf("WaitForSingleObject failed (%d)\n", GetLastError());
+			return 1;
+	}
+
+	CloseEvents();
+
 	system("PAUSE");
-    return 0;
+
+	return 0;
+}
+
+DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
+	UNREFERENCED_PARAMETER(lpParam);
+	UINT count=2;
+
+	for(UINT i=0; i<count; i++) {
+		WaitForSingleObject(
+			ghCollectorEvent,
+			INFINITE);
+		WriteToBuffer();
+	}
+
+	printf("Dispatcher thread exiting\n");
+
+	return 0;
+}
+
+DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
+	//UNREFERENCED_PARAMETER(lpParam);
+	pair<HANDLE, HANDLE> * it=(pair<HANDLE, HANDLE>*) lpParam;
+	HANDLE hDispatcherEvent=it->first;
+	HANDLE hWorkerEvent=it->second;
+
+	DWORD dwWaitResult;
+
+	while(1) {
+	printf("Worker Thread %d waiting for write event...\n", GetCurrentThreadId());
+
+	dwWaitResult=WaitForSingleObject(
+		hDispatcherEvent,
+		INFINITE);
+
+	switch(dwWaitResult) {
+		case WAIT_OBJECT_0:
+			WaitForSingleObject(
+				ghBufferMutex,
+				INFINITE);
+			printf("Worker Thread %d reading from buffer, got %d\n", GetCurrentThreadId(), buffer);
+			buffer--;
+			ReleaseMutex(ghBufferMutex);
+			SetEvent(hWorkerEvent);
+			break;
+
+		default:
+			printf("Wait error (%d)\n", GetLastError());
+			return 0;
+	}
+	}
+
+	printf("Worker Thread %d exiting\n", GetCurrentThreadId());
+
+	return 0;
+}
+
+DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
+	UNREFERENCED_PARAMETER(lpParam);
+	UINT count=2;
+	DWORD dwWaitResult;
+
+	for(UINT i=0; i<count; i++) {
+		printf("Collector Thread waiting for worker events...\n");
+
+		dwWaitResult=WaitForMultipleObjects(
+			THREADCOUNT,
+			ghWorkerEvents,
+			TRUE,
+			INFINITE);
+
+		switch(dwWaitResult) {
+			case WAIT_OBJECT_0:
+				printf("Collector Thread reading from buffer\n");
+				break;
+
+			default:
+				printf("Wait error (%d)\n", GetLastError());
+				return 0;
+		}
+
+		SetEvent(ghCollectorEvent);
+	}
+
+	printf("Collector Thread exiting\n");
+
+	return 0;
 }
