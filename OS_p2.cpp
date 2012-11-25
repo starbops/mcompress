@@ -1,8 +1,9 @@
 #include <iostream>
-#include <vector>
+#include <fstream>
 #include <list>
 #include <windows.h>
 #include <stdio.h>
+#include "lzfx.h"
 using namespace std;
 
 #define THREADCOUNT 4
@@ -24,8 +25,8 @@ HANDLE ghDispatcherThread, ghWorkerThreads[THREADCOUNT], ghCollectorThread;
 
 // GLOBAL RESOURCE
 
-char * data="abcdefghijklmn";
-list<char> inBuffer, outBuffer;
+list<char*> inBuffer, outBuffer;
+UINT turns, lastChunkLength;
 
 // PROTOTYPE
 
@@ -149,7 +150,19 @@ void CloseEvents() {
 	CloseHandle(ghCollectorEvent);
 }
 
-void WriteToBuffer(char * p, UINT size) {
+void CalcTurns(char * fileName, UINT chunkSize) {
+	UINT length=0;
+
+	ifstream f(fileName, ios::in|ios::ate);
+	if(f.is_open())
+		length=(UINT)f.tellg();
+	turns=(length%chunkSize==0)? (length/chunkSize): (length/chunkSize)+1;
+	lastChunkLength=length-chunkSize*(turns-1);
+
+	return ;
+}
+
+void WriteToBuffer(char * memBlock, UINT size) {
 	DWORD dwWaitResult;
 
 	dwWaitResult=WaitForSingleObject(
@@ -159,8 +172,7 @@ void WriteToBuffer(char * p, UINT size) {
 	switch(dwWaitResult) {
 		case WAIT_OBJECT_0:
 			printf("Dispatcher thread writing to the shared buffer...\n");
-			for(UINT i=0; i<size; i++)
-				inBuffer.push_back(*(p+i));
+			inBuffer.push_back(memBlock);
 			ReleaseMutex(ghInBufferMutex);
 			break;
 		default:
@@ -168,15 +180,15 @@ void WriteToBuffer(char * p, UINT size) {
 			return ;
 	}
 
-	for(int i=0; i<THREADCOUNT; i++)
-		SetEvent(ghDispatcherEvents[i]);
-
 	printf("Dispatcher thread writing to the shared buffer is complete.\n");
 }
 
 int main(void) {
 	DWORD dwWaitResult;
+	char * fileName="input";
+	UINT chunkSize=256*1024;
 
+	CalcTurns(fileName, chunkSize);
 	CreateMutexAndEvents();
 	CreateThreads();
 
@@ -203,18 +215,31 @@ int main(void) {
 
 DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
-	char * p=data;
-	UINT size=0;
+	char * memBlock=NULL;
+	UINT i, j, chunkSize=256*1024;
+	ifstream srcFile;
 
-	for(; *p!='\0'; p+=size) {
-		size=0;
-		WaitForSingleObject(
-			ghCollectorEvent,
-			INFINITE);
-		for(char * tmp=p; (size<THREADCOUNT)&&(*tmp!='\0'); tmp++)
-			size++;
-		WriteToBuffer(p, size);
+	srcFile.open("input", ios::in|ios::binary);
+	if(srcFile.is_open()) {
+
+
+		for(i=0; i<turns; i+=j) {
+			WaitForSingleObject(
+				ghCollectorEvent,
+				INFINITE);
+			for(j=0; (j<THREADCOUNT)&&((j+i)<turns); j++) {
+				memBlock=new char [chunkSize];
+				srcFile.read(memBlock, chunkSize);
+				WriteToBuffer(memBlock, chunkSize);		// BONUS
+			}											// MAY
+			for(int i=0; i<THREADCOUNT; i++)			// HAPPENS
+				SetEvent(ghDispatcherEvents[i]);		// HERE
+		}
+
+		srcFile.close();
 	}
+	else
+		return 1;
 
 	printf("Dispatcher thread exiting\n");
 
@@ -266,44 +291,54 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 
 DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
-	UINT end=0;
-	for(UINT i=0; data[i]!='\0'; i++)
-		end++;
-	UINT count=(end%THREADCOUNT==0)? (end/THREADCOUNT): (end/THREADCOUNT)+1;
+	UINT i, j, end=0;
+	UINT chunkSize=256*1024;
 	DWORD dwWaitResult;
+	ofstream desFile;
 
-	for(UINT i=0; i<count; i++) {
-		printf("Collector Thread waiting for worker events...\n");
+	desFile.open("output", ios::out|ios::binary);
+	if(desFile.is_open()) {
+		for(i=0; i<turns; i+=j) {
+			printf("Collector Thread waiting for worker events...\n");
 
-		dwWaitResult=WaitForMultipleObjects(
-			THREADCOUNT,
-			ghWorkerEvents,
-			TRUE,
-			INFINITE);
+			dwWaitResult=WaitForMultipleObjects(
+				THREADCOUNT,
+				ghWorkerEvents,
+				TRUE,
+				INFINITE);
 
-		switch(dwWaitResult) {
-			case WAIT_OBJECT_0:
-				WaitForSingleObject(
-					ghOutBufferMutex,
-					INFINITE);
-				for(int i=0; i<THREADCOUNT; i++) {
-					if(outBuffer.empty()) {
-						printf("OHHHHHHHHHHHHHHHHHHHHHOHOHOH\n");
-						break;
+			switch(dwWaitResult) {
+				case WAIT_OBJECT_0:
+					WaitForSingleObject(
+						ghOutBufferMutex,
+						INFINITE);
+					for(j=0; (j<THREADCOUNT)&&((j+i)<turns); j++) {
+						if(outBuffer.empty()) {
+							printf("OHHHHHHHHHHHHHHHHHHHHHOHOHOH\n");
+							break;
+						}
+						printf("Collector Thread reading from buffer, got %c\n", outBuffer.front());
+						if((j+i)==turns-1) {
+							desFile.write(outBuffer.front(), lastChunkLength);
+							printf("ALKDHFKSJDHFAKSJDFH\n");
+						}
+						else
+							desFile.write(outBuffer.front(), chunkSize);
+						outBuffer.pop_front();
 					}
-					printf("Collector Thread reading from buffer, got %c\n", outBuffer.front());
-					outBuffer.pop_front();
-				}
-				ReleaseMutex(ghOutBufferMutex);
-				break;
+					ReleaseMutex(ghOutBufferMutex);
+					break;
 
-			default:
-				printf("Wait error (%d)\n", GetLastError());
-				return 0;
+				default:
+					printf("Wait error (%d)\n", GetLastError());
+					return 0;
+			}
+
+			SetEvent(ghCollectorEvent);
 		}
-
-		SetEvent(ghCollectorEvent);
 	}
+	else
+		return 1;
 
 	printf("Collector Thread exiting\n");
 
