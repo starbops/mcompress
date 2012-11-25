@@ -16,7 +16,7 @@ HANDLE ghInBufferMutex, ghOutBufferMutex;
 
 // EVENT HANDLER
 
-HANDLE ghDispatcherEvents[THREADCOUNT], ghWorkerEvents[THREADCOUNT], ghCollectorEvent;
+HANDLE ghDispatcherEvents[THREADCOUNT], ghWorkerEvents[THREADCOUNT], ghCollectorEvent, ghDecompressEvent, ghFinallyDone;
 pair<HANDLE, HANDLE> ghPairEvents[THREADCOUNT];
 
 // THREAD HANDLER
@@ -27,7 +27,7 @@ HANDLE ghDispatcherThread, ghWorkerThreads[THREADCOUNT], ghCollectorThread;
 
 list< pair<char*, UINT> > inBuffer;
 list< pair<char*, UINT> > outBuffer;
-UINT turns, lastChunkLength;
+UINT originalSize, turns, lastChunkLength;
 
 // PROTOTYPE
 
@@ -94,6 +94,26 @@ void CreateMutexAndEvents(void) {
 		printf("CreateEvent: Collector failed (%d)\n", GetLastError());
 		return ;
 	}
+
+	ghDecompressEvent=CreateEvent(
+		NULL,
+		FALSE,
+		FALSE,
+		NULL);
+	if(ghDecompressEvent==NULL) {
+		printf("CreateEvent: Decompress failed (%d)\n", GetLastError());
+		return ;
+	}
+
+	ghFinallyDone=CreateEvent(
+		NULL,
+		FALSE,
+		FALSE,
+		NULL);
+	if(ghFinallyDone==NULL) {
+		printf("CreateEvent: Final failed (%d)\n", GetLastError());
+		return ;
+	}
 }
 
 void CreateThreads(void) {
@@ -149,16 +169,16 @@ void CloseEvents() {
 	for(i=0; i<THREADCOUNT; i++)
 		CloseHandle(ghWorkerEvents[i]);
 	CloseHandle(ghCollectorEvent);
+	CloseHandle(ghDecompressEvent);
+	CloseHandle(ghFinallyDone);
 }
 
 void CalcTurns(char * fileName, UINT chunkSize) {
-	UINT length=0;
-
 	ifstream f(fileName, ios::in|ios::ate);
 	if(f.is_open())
-		length=(UINT)f.tellg();
-	turns=(length%chunkSize==0)? (length/chunkSize): (length/chunkSize)+1;
-	lastChunkLength=length-chunkSize*(turns-1);
+		originalSize=(UINT)f.tellg();
+	turns=(originalSize%chunkSize==0)? (originalSize/chunkSize): (originalSize/chunkSize)+1;
+	lastChunkLength=originalSize-chunkSize*(turns-1);
 
 	return ;
 }
@@ -209,7 +229,7 @@ int main(void) {
 
 	CloseEvents();
 
-	system("PAUSE");
+	//system("PAUSE");
 
 	return 0;
 }
@@ -248,6 +268,32 @@ DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 	else
 		return 1;
 
+	WaitForSingleObject(
+		ghDecompressEvent,
+		INFINITE);
+	printf("Dispatcher starts decompressing...\n");
+	ifstream cFile;
+	ofstream dFile;
+	cFile.open("cmpFile", ios::in|ios::binary|ios::ate);
+	dFile.open("output", ios::out|ios::binary);
+	if(cFile.is_open()&&dFile.is_open()) {
+		char *cMemBlock=NULL, *dMemBlock=NULL;
+		UINT cSize=0, dSize=0;
+
+		cSize=(UINT)cFile.tellg();
+		cFile.seekg(0, cFile.beg);
+		dSize=originalSize;
+		cMemBlock=new char [cSize];
+		dMemBlock=new char [dSize];
+		cFile.read(cMemBlock, cSize);
+		printf("GGGGG%d\n", lzfx_decompress(cMemBlock, cSize, dMemBlock, &dSize));
+		dFile.write(dMemBlock, dSize);
+
+		cFile.close();
+		dFile.close();
+	}
+
+	SetEvent(ghFinallyDone);
 	printf("Dispatcher thread exiting\n");
 
 	return 0;
@@ -308,7 +354,7 @@ DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 	DWORD dwWaitResult;
 	ofstream desFile;
 
-	desFile.open("output", ios::out|ios::binary);
+	desFile.open("cmpFile", ios::out|ios::binary);
 	if(desFile.is_open()) {
 		for(i=0; i<turns; i+=j) {
 			printf("Collector Thread waiting for worker events...\n");
@@ -343,11 +389,17 @@ DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 
 			SetEvent(ghCollectorEvent);
 		}
+
+		desFile.close();
 	}
 	else
 		return 1;
 
 	printf("Collector Thread exiting\n");
+	SetEvent(ghDecompressEvent);
+	WaitForSingleObject(
+		ghFinallyDone,
+		INFINITE);
 
 	return 0;
 }
