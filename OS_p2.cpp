@@ -6,8 +6,6 @@
 #include "lzfx.h"
 using namespace std;
 
-#define THREADCOUNT 16
-
 typedef unsigned int UINT;
 
 // MUTEX HANDLER
@@ -16,18 +14,19 @@ HANDLE ghInBufferMutex, ghOutBufferMutex;
 
 // EVENT HANDLER
 
-HANDLE ghDispatcherEvents[THREADCOUNT], ghWorkerEvents[THREADCOUNT], ghCollectorEvent, ghDecompressEvent, ghFinallyDone;
-pair<HANDLE, HANDLE> ghPairEvents[THREADCOUNT];
+HANDLE *ghDispatcherEvents, *ghWorkerEvents, ghCollectorEvent, ghDecompressEvent, ghFinallyDone;
+pair<HANDLE, HANDLE> * ghPairEvents;
 
 // THREAD HANDLER
 
-HANDLE ghDispatcherThread, ghWorkerThreads[THREADCOUNT], ghCollectorThread;
+HANDLE ghDispatcherThread, *ghWorkerThreads, ghCollectorThread;
 
 // GLOBAL RESOURCE
 
 list< pair<char*, UINT> > inBuffer;
 list< pair<char*, UINT> > outBuffer;
-UINT originalSize, turns, lastChunkLength;
+UINT chunkSize, originalSize, turns, threadCount=4, lastChunkLength;
+char oFileName[50], cFileName[50];
 
 // PROTOTYPE
 
@@ -37,6 +36,9 @@ DWORD WINAPI CollectorThreadProc(LPVOID);
 
 void CreateMutexAndEvents(void) {
 	int i;
+	ghDispatcherEvents=new HANDLE [threadCount];
+	ghWorkerEvents=new HANDLE [threadCount];
+	ghPairEvents=new pair<HANDLE, HANDLE> [threadCount];
 
 	ghInBufferMutex=CreateMutex(
 		NULL,
@@ -58,7 +60,7 @@ void CreateMutexAndEvents(void) {
 		return ;
 	}
 
-	for(i=0; i<THREADCOUNT; i++) {
+	for(i=0; i<threadCount; i++) {
 		ghDispatcherEvents[i]=CreateEvent(
 			NULL,
 			FALSE,
@@ -70,7 +72,7 @@ void CreateMutexAndEvents(void) {
 		}
 	}
 
-	for(i=0; i<THREADCOUNT; i++) {
+	for(i=0; i<threadCount; i++) {
 		ghWorkerEvents[i]=CreateEvent(
 			NULL,
 			FALSE,
@@ -82,7 +84,7 @@ void CreateMutexAndEvents(void) {
 		}
 	}
 
-	for(i=0; i<THREADCOUNT; i++)
+	for(i=0; i<threadCount; i++)
 		ghPairEvents[i]=make_pair(ghDispatcherEvents[i], ghWorkerEvents[i]);
 
 	ghCollectorEvent=CreateEvent(
@@ -119,6 +121,7 @@ void CreateMutexAndEvents(void) {
 void CreateThreads(void) {
 	int i;
 	DWORD dwThreadId;
+	ghWorkerThreads=new HANDLE [threadCount];
 
 	ghDispatcherThread=CreateThread(
 		NULL,
@@ -133,7 +136,7 @@ void CreateThreads(void) {
 		return ;
 	}
 
-	for(i=0; i<THREADCOUNT; i++) {
+	for(i=0; i<threadCount; i++) {
 		ghWorkerThreads[i]=CreateThread(
 			NULL,
 			0,
@@ -164,17 +167,32 @@ void CreateThreads(void) {
 
 void CloseEvents() {
 	int i;
-	for(i=0; i<THREADCOUNT; i++)
+	for(i=0; i<threadCount; i++)
 		CloseHandle(ghDispatcherEvents[i]);
-	for(i=0; i<THREADCOUNT; i++)
+	for(i=0; i<threadCount; i++)
 		CloseHandle(ghWorkerEvents[i]);
 	CloseHandle(ghCollectorEvent);
 	CloseHandle(ghDecompressEvent);
 	CloseHandle(ghFinallyDone);
 }
 
-void CalcTurns(char * fileName, UINT chunkSize) {
-	ifstream f(fileName, ios::in|ios::ate);
+void GetUser(void) {
+
+	cout<<"Input file name? ";
+	cin>>oFileName;
+	cout<<"Output file name? ";
+	cin>>cFileName;
+	cout<<"Chunk size? ";
+	cin>>chunkSize;
+	chunkSize*=1024;
+	cout<<"# of worker threads? ";
+	cin>>threadCount;
+
+	return ;
+}
+
+void CalcTurns(void) {
+	ifstream f(oFileName, ios::in|ios::ate);
 	if(f.is_open())
 		originalSize=(UINT)f.tellg();
 	turns=(originalSize%chunkSize==0)? (originalSize/chunkSize): (originalSize/chunkSize)+1;
@@ -206,10 +224,9 @@ void WriteToBuffer(char * memBlock, UINT size) {
 
 int main(void) {
 	DWORD dwWaitResult;
-	char * fileName="input";
-	UINT chunkSize=256*1024;
 
-	CalcTurns(fileName, chunkSize);
+	GetUser();
+	CalcTurns();
 	CreateMutexAndEvents();
 	CreateThreads();
 
@@ -229,7 +246,7 @@ int main(void) {
 
 	CloseEvents();
 
-	//system("PAUSE");
+	system("PAUSE");
 
 	return 0;
 }
@@ -237,10 +254,10 @@ int main(void) {
 DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
 	char * memBlock=NULL;
-	UINT i, j, current=0, end=0, size=0, chunkSize=256*1024;
+	UINT i, j, current=0, end=0, size=0;
 	ifstream srcFile;
 
-	srcFile.open("input", ios::in|ios::binary|ios::ate);
+	srcFile.open(oFileName, ios::in|ios::binary|ios::ate);
 	if(srcFile.is_open()) {
 		end=(UINT)srcFile.tellg();
 		srcFile.seekg(0, srcFile.beg);
@@ -249,7 +266,7 @@ DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 			WaitForSingleObject(
 				ghCollectorEvent,
 				INFINITE);
-			for(j=0; (j<THREADCOUNT)&&((j+i)<turns); j++) {
+			for(j=0; (j<threadCount)&&((j+i)<turns); j++) {
 				current=(UINT)srcFile.tellg();
 				if((end-current)<chunkSize)
 					size=end-current;
@@ -259,7 +276,7 @@ DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 				srcFile.read(memBlock, size);
 				WriteToBuffer(memBlock, size);			// BONUS
 			}											// MAY
-			for(int i=0; i<THREADCOUNT; i++)			// HAPPENS
+			for(int i=0; i<threadCount; i++)			// HAPPENS
 				SetEvent(ghDispatcherEvents[i]);		// HERE
 		}
 
@@ -274,23 +291,25 @@ DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 	printf("Dispatcher starts decompressing...\n");
 	ifstream cFile;
 	ofstream dFile;
-	cFile.open("cmpFile", ios::in|ios::binary|ios::ate);
-	dFile.open("output", ios::out|ios::binary);
-	if(cFile.is_open()&&dFile.is_open()) {
-		char *cMemBlock=NULL, *dMemBlock=NULL;
-		UINT cSize=0, dSize=0;
+	cFile.open(cFileName, ios::in|ios::binary|ios::ate);
+	if(cFile.is_open()) {
+		dFile.open("output", ios::out|ios::binary);
+		if(dFile.is_open()) {
+			char *cMemBlock=NULL, *dMemBlock=NULL;
+			UINT cSize=0, dSize=0;
 
-		cSize=(UINT)cFile.tellg();
-		cFile.seekg(0, cFile.beg);
-		dSize=originalSize;
-		cMemBlock=new char [cSize];
-		dMemBlock=new char [dSize];
-		cFile.read(cMemBlock, cSize);
-		printf("GGGGG%d\n", lzfx_decompress(cMemBlock, cSize, dMemBlock, &dSize));
-		dFile.write(dMemBlock, dSize);
+			cSize=(UINT)cFile.tellg();
+			cFile.seekg(0, cFile.beg);
+			dSize=originalSize;
+			cMemBlock=new char [cSize];
+			dMemBlock=new char [dSize];
+			cFile.read(cMemBlock, cSize);
+			printf("GGGGG%d\n", lzfx_decompress(cMemBlock, cSize, dMemBlock, &dSize));
+			dFile.write(dMemBlock, dSize);
 
+			dFile.close();
+		}
 		cFile.close();
-		dFile.close();
 	}
 
 	SetEvent(ghFinallyDone);
@@ -306,7 +325,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 
 	char * memBlock=NULL;
 	DWORD dwWaitResult;
-	UINT chunkSize=256*1024, cChunkSize=0;
+	UINT cChunkSize=0;
 
 	while(1) {
 	printf("Worker Thread %d waiting for write event...\n", GetCurrentThreadId());
@@ -350,17 +369,16 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
 	UINT i, j, end=0;
-	UINT chunkSize=0;
 	DWORD dwWaitResult;
 	ofstream desFile;
 
-	desFile.open("cmpFile", ios::out|ios::binary);
+	desFile.open(cFileName, ios::out|ios::binary);
 	if(desFile.is_open()) {
 		for(i=0; i<turns; i+=j) {
 			printf("Collector Thread waiting for worker events...\n");
 
 			dwWaitResult=WaitForMultipleObjects(
-				THREADCOUNT,
+				threadCount,
 				ghWorkerEvents,
 				TRUE,
 				INFINITE);
@@ -370,7 +388,7 @@ DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 					WaitForSingleObject(
 						ghOutBufferMutex,
 						INFINITE);
-					for(j=0; (j<THREADCOUNT)&&((j+i)<turns); j++) {
+					for(j=0; (j<threadCount)&&((j+i)<turns); j++) {
 						if(outBuffer.empty()) {
 							printf("OHHHHHHHHHHHHHHHHHHHHHOHOHOH\n");
 							break;
