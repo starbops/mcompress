@@ -1,5 +1,6 @@
 #include <iostream>
 #include <vector>
+#include <list>
 #include <windows.h>
 #include <stdio.h>
 using namespace std;
@@ -10,7 +11,7 @@ typedef unsigned int UINT;
 
 // MUTEX HANDLER
 
-HANDLE ghBufferMutex;
+HANDLE ghInBufferMutex, ghOutBufferMutex;
 
 // EVENT HANDLER
 
@@ -23,7 +24,8 @@ HANDLE ghDispatcherThread, ghWorkerThreads[THREADCOUNT], ghCollectorThread;
 
 // GLOBAL RESOURCE
 
-/*std::vector< std::pair<char*, UINT> >*/UINT buffer=0;
+char * data="abcdefghijklmn";
+list<char> inBuffer, outBuffer;
 
 // PROTOTYPE
 
@@ -34,13 +36,23 @@ DWORD WINAPI CollectorThreadProc(LPVOID);
 void CreateMutexAndEvents(void) {
 	int i;
 
-	ghBufferMutex=CreateMutex(
+	ghInBufferMutex=CreateMutex(
 		NULL,
 		FALSE,
 		NULL);
 
-	if(ghBufferMutex==NULL) {
-		printf("CreateMutex failed (%d)\n", GetLastError());
+	if(ghInBufferMutex==NULL) {
+		printf("CreateMutex: InBuffer failed (%d)\n", GetLastError());
+		return ;
+	}
+
+	ghOutBufferMutex=CreateMutex(
+		NULL,
+		FALSE,
+		NULL);
+
+	if(ghOutBufferMutex==NULL) {
+		printf("CreateMutex: OutBuffer failed (%d)\n", GetLastError());
 		return ;
 	}
 
@@ -137,18 +149,19 @@ void CloseEvents() {
 	CloseHandle(ghCollectorEvent);
 }
 
-void WriteToBuffer(void) {
+void WriteToBuffer(char * p, UINT size) {
 	DWORD dwWaitResult;
 
 	dwWaitResult=WaitForSingleObject(
-		ghBufferMutex,
+		ghInBufferMutex,
 		INFINITE);
 
 	switch(dwWaitResult) {
 		case WAIT_OBJECT_0:
 			printf("Dispatcher thread writing to the shared buffer...\n");
-			buffer+=4;
-			ReleaseMutex(ghBufferMutex);
+			for(UINT i=0; i<size; i++)
+				inBuffer.push_back(*(p+i));
+			ReleaseMutex(ghInBufferMutex);
 			break;
 		default:
 			printf("WaitForSingleObject failed (%d)\n", GetLastError());
@@ -190,13 +203,17 @@ int main(void) {
 
 DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
-	UINT count=2;
+	char * p=data;
+	UINT size=0;
 
-	for(UINT i=0; i<count; i++) {
+	for(; *p!='\0'; p+=size) {
+		size=0;
 		WaitForSingleObject(
 			ghCollectorEvent,
 			INFINITE);
-		WriteToBuffer();
+		for(char * tmp=p; (size<THREADCOUNT)&&(*tmp!='\0'); tmp++)
+			size++;
+		WriteToBuffer(p, size);
 	}
 
 	printf("Dispatcher thread exiting\n");
@@ -205,7 +222,6 @@ DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 }
 
 DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
-	//UNREFERENCED_PARAMETER(lpParam);
 	pair<HANDLE, HANDLE> * it=(pair<HANDLE, HANDLE>*) lpParam;
 	HANDLE hDispatcherEvent=it->first;
 	HANDLE hWorkerEvent=it->second;
@@ -222,11 +238,18 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 	switch(dwWaitResult) {
 		case WAIT_OBJECT_0:
 			WaitForSingleObject(
-				ghBufferMutex,
+				ghInBufferMutex,
 				INFINITE);
-			printf("Worker Thread %d reading from buffer, got %d\n", GetCurrentThreadId(), buffer);
-			buffer--;
-			ReleaseMutex(ghBufferMutex);
+			WaitForSingleObject(
+				ghOutBufferMutex,
+				INFINITE);
+			if(!inBuffer.empty()) {
+				printf("Worker Thread %d reading from buffer, got %c\n", GetCurrentThreadId(), inBuffer.front());
+				outBuffer.push_back(inBuffer.front());
+				inBuffer.pop_front();
+			}
+			ReleaseMutex(ghOutBufferMutex);
+			ReleaseMutex(ghInBufferMutex);
 			SetEvent(hWorkerEvent);
 			break;
 
@@ -243,7 +266,10 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 
 DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
-	UINT count=2;
+	UINT end=0;
+	for(UINT i=0; data[i]!='\0'; i++)
+		end++;
+	UINT count=(end%THREADCOUNT==0)? (end/THREADCOUNT): (end/THREADCOUNT)+1;
 	DWORD dwWaitResult;
 
 	for(UINT i=0; i<count; i++) {
@@ -257,7 +283,18 @@ DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 
 		switch(dwWaitResult) {
 			case WAIT_OBJECT_0:
-				printf("Collector Thread reading from buffer\n");
+				WaitForSingleObject(
+					ghOutBufferMutex,
+					INFINITE);
+				for(int i=0; i<THREADCOUNT; i++) {
+					if(outBuffer.empty()) {
+						printf("OHHHHHHHHHHHHHHHHHHHHHOHOHOH\n");
+						break;
+					}
+					printf("Collector Thread reading from buffer, got %c\n", outBuffer.front());
+					outBuffer.pop_front();
+				}
+				ReleaseMutex(ghOutBufferMutex);
 				break;
 
 			default:
