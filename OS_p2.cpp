@@ -6,7 +6,7 @@
 #include "lzfx.h"
 using namespace std;
 
-#define THREADCOUNT 4
+#define THREADCOUNT 16
 
 typedef unsigned int UINT;
 
@@ -25,7 +25,8 @@ HANDLE ghDispatcherThread, ghWorkerThreads[THREADCOUNT], ghCollectorThread;
 
 // GLOBAL RESOURCE
 
-list<char*> inBuffer, outBuffer;
+list< pair<char*, UINT> > inBuffer;
+list< pair<char*, UINT> > outBuffer;
 UINT turns, lastChunkLength;
 
 // PROTOTYPE
@@ -172,7 +173,7 @@ void WriteToBuffer(char * memBlock, UINT size) {
 	switch(dwWaitResult) {
 		case WAIT_OBJECT_0:
 			printf("Dispatcher thread writing to the shared buffer...\n");
-			inBuffer.push_back(memBlock);
+			inBuffer.push_back(make_pair(memBlock, size));
 			ReleaseMutex(ghInBufferMutex);
 			break;
 		default:
@@ -216,21 +217,27 @@ int main(void) {
 DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
 	char * memBlock=NULL;
-	UINT i, j, chunkSize=256*1024;
+	UINT i, j, current=0, end=0, size=0, chunkSize=256*1024;
 	ifstream srcFile;
 
-	srcFile.open("input", ios::in|ios::binary);
+	srcFile.open("input", ios::in|ios::binary|ios::ate);
 	if(srcFile.is_open()) {
-
+		end=(UINT)srcFile.tellg();
+		srcFile.seekg(0, srcFile.beg);
 
 		for(i=0; i<turns; i+=j) {
 			WaitForSingleObject(
 				ghCollectorEvent,
 				INFINITE);
 			for(j=0; (j<THREADCOUNT)&&((j+i)<turns); j++) {
-				memBlock=new char [chunkSize];
-				srcFile.read(memBlock, chunkSize);
-				WriteToBuffer(memBlock, chunkSize);		// BONUS
+				current=(UINT)srcFile.tellg();
+				if((end-current)<chunkSize)
+					size=end-current;
+				else
+					size=chunkSize;
+				memBlock=new char [size];
+				srcFile.read(memBlock, size);
+				WriteToBuffer(memBlock, size);			// BONUS
 			}											// MAY
 			for(int i=0; i<THREADCOUNT; i++)			// HAPPENS
 				SetEvent(ghDispatcherEvents[i]);		// HERE
@@ -251,7 +258,9 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 	HANDLE hDispatcherEvent=it->first;
 	HANDLE hWorkerEvent=it->second;
 
+	char * memBlock=NULL;
 	DWORD dwWaitResult;
+	UINT chunkSize=256*1024, cChunkSize=0;
 
 	while(1) {
 	printf("Worker Thread %d waiting for write event...\n", GetCurrentThreadId());
@@ -270,8 +279,11 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 				INFINITE);
 			if(!inBuffer.empty()) {
 				printf("Worker Thread %d reading from buffer, got %c\n", GetCurrentThreadId(), inBuffer.front());
-				outBuffer.push_back(inBuffer.front());
+				cChunkSize=((inBuffer.front()).second)*2;
+				memBlock=new char [cChunkSize];
+				printf("!ERROR! (%d)\n", lzfx_compress((inBuffer.front()).first, (inBuffer.front()).second,memBlock, &cChunkSize));
 				inBuffer.pop_front();
+				outBuffer.push_back(make_pair(memBlock, cChunkSize));
 			}
 			ReleaseMutex(ghOutBufferMutex);
 			ReleaseMutex(ghInBufferMutex);
@@ -292,7 +304,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
 	UINT i, j, end=0;
-	UINT chunkSize=256*1024;
+	UINT chunkSize=0;
 	DWORD dwWaitResult;
 	ofstream desFile;
 
@@ -317,13 +329,8 @@ DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 							printf("OHHHHHHHHHHHHHHHHHHHHHOHOHOH\n");
 							break;
 						}
-						printf("Collector Thread reading from buffer, got %c\n", outBuffer.front());
-						if((j+i)==turns-1) {
-							desFile.write(outBuffer.front(), lastChunkLength);
-							printf("ALKDHFKSJDHFAKSJDFH\n");
-						}
-						else
-							desFile.write(outBuffer.front(), chunkSize);
+						printf("Collector Thread reading from buffer, got %c\n", (outBuffer.front()).second);
+						desFile.write((outBuffer.front()).first, (outBuffer.front()).second);
 						outBuffer.pop_front();
 					}
 					ReleaseMutex(ghOutBufferMutex);
