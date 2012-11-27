@@ -223,9 +223,15 @@ void WriteToBuffer(char * memBlock, UINT size) {
 }
 
 int main(void) {
+	LARGE_INTEGER ticksPerSecond;
+	LARGE_INTEGER startTick;
+	LARGE_INTEGER endTick;
+	double elapsed=0.0;
 	DWORD dwWaitResult;
 
 	GetUser();
+	QueryPerformanceFrequency(&ticksPerSecond);
+	QueryPerformanceCounter(&startTick);
 	CalcTurns();
 	CreateMutexAndEvents();
 	CreateThreads();
@@ -245,6 +251,10 @@ int main(void) {
 	}
 
 	CloseEvents();
+
+	QueryPerformanceCounter(&endTick);
+	elapsed=((double)(endTick.QuadPart-startTick.QuadPart)/ticksPerSecond.QuadPart);
+	printf("Time elapse = %lf (s)\n", elapsed);
 
 	system("PAUSE");
 
