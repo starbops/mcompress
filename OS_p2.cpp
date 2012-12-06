@@ -35,7 +35,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID);
 DWORD WINAPI CollectorThreadProc(LPVOID);
 
 void CreateMutexAndEvents(void) {
-	int i;
+	UINT i;
 	ghDispatcherEvents=new HANDLE [threadCount];
 	ghWorkerEvents=new HANDLE [threadCount];
 	ghPairEvents=new pair<HANDLE, HANDLE> [threadCount];
@@ -119,7 +119,7 @@ void CreateMutexAndEvents(void) {
 }
 
 void CreateThreads(void) {
-	int i;
+	UINT i;
 	DWORD dwThreadId;
 	ghWorkerThreads=new HANDLE [threadCount];
 
@@ -166,7 +166,7 @@ void CreateThreads(void) {
 }
 
 void CloseEvents() {
-	int i;
+	UINT i;
 	for(i=0; i<threadCount; i++)
 		CloseHandle(ghDispatcherEvents[i]);
 	for(i=0; i<threadCount; i++)
@@ -204,25 +204,37 @@ void CalcTurns(void) {
 	return ;
 }
 
-void WriteToBuffer(char * memBlock, UINT size, UINT order) {
-	DWORD dwWaitResult;
-
-	dwWaitResult=WaitForSingleObject(
-		ghInBufferMutex,
+void Decompression(void) {
+	WaitForSingleObject(
+		ghDecompressEvent,
 		INFINITE);
+	ifstream cFile;
+	ofstream dFile;
+	cFile.open(cFileName, ios::in|ios::binary|ios::ate);
+	if(cFile.is_open()) {
+		dFile.open("output", ios::out|ios::binary);
+		if(dFile.is_open()) {
+			char *cMemBlock=NULL, *dMemBlock=NULL;
+			UINT cSize=0, dSize=0;
 
-	switch(dwWaitResult) {
-		case WAIT_OBJECT_0:
-			//printf("Dispatcher thread writing to the shared buffer...\n");
-			inBuffer.push_back(make_pair(make_pair(memBlock, size), order));
-			ReleaseMutex(ghInBufferMutex);
-			break;
-		default:
-			printf("WaitForSingleObject failed (%d)\n", GetLastError());
-			return ;
+			cSize=(UINT)cFile.tellg();
+			cFile.seekg(0, cFile.beg);
+			dSize=originalSize;
+			cMemBlock=new char [cSize];
+			dMemBlock=new char [dSize];
+			cFile.read(cMemBlock, cSize);
+			lzfx_decompress(cMemBlock, cSize, dMemBlock, &dSize);
+			dFile.write(dMemBlock, dSize);
+
+			delete [] cMemBlock;
+			delete [] dMemBlock;
+
+			dFile.close();
+		}
+		cFile.close();
 	}
 
-	//printf("Dispatcher thread writing to the shared buffer is complete.\n");
+	return ;
 }
 
 int main(void) {
@@ -230,7 +242,6 @@ int main(void) {
 	LARGE_INTEGER startTick;
 	LARGE_INTEGER endTick;
 	double elapsed=0.0;
-	DWORD dwWaitResult;
 
 	GetUser();
 	QueryPerformanceFrequency(&ticksPerSecond);
@@ -239,19 +250,9 @@ int main(void) {
 	CreateMutexAndEvents();
 	CreateThreads();
 
-	dwWaitResult=WaitForSingleObject(
+	WaitForSingleObject(
 		ghCollectorThread,
 		INFINITE);
-
-	switch(dwWaitResult) {
-		case WAIT_OBJECT_0:
-			//printf("All threads ended, cleaning up for application exit...\n");
-			break;
-
-		default:
-			printf("WaitForSingleObject failed (%d)\n", GetLastError());
-			return 1;
-	}
 
 	CloseEvents();
 
@@ -280,60 +281,24 @@ DWORD WINAPI DispatcherThreadProc(LPVOID lpParam) {
 				ghCollectorEvent,
 				INFINITE);
 			for(j=0; (j<threadCount)&&((j+i)<turns); j++) {
-				/*
-				current=(UINT)srcFile.tellg();
-				if((end-current)<chunkSize)
-					size=end-current;
-				else
-					size=chunkSize;
-				*/
 				if((j+i)==(turns-1))
 					size=lastChunkLength;
 				else
 					size=chunkSize;
 				memBlock=new char [size];
 				srcFile.read(memBlock, size);
-				WriteToBuffer(memBlock, size, j);			// BONUS
-			}											// MAY
-			for(int i=0; i<threadCount; i++)			// HAPPENS
-				SetEvent(ghDispatcherEvents[i]);		// HERE
+				inBuffer.push_back(make_pair(make_pair(memBlock, size), j));
+			}
+			for(UINT i=0; i<threadCount; i++)
+				SetEvent(ghDispatcherEvents[i]);
 		}
 
 		srcFile.close();
 	}
 	else
 		return 1;
-	
-	WaitForSingleObject(
-		ghDecompressEvent,
-		INFINITE);
-	//printf("Dispatcher starts decompressing...\n");
-	ifstream cFile;
-	ofstream dFile;
-	cFile.open(cFileName, ios::in|ios::binary|ios::ate);
-	if(cFile.is_open()) {
-		dFile.open("output", ios::out|ios::binary);
-		if(dFile.is_open()) {
-			char *cMemBlock=NULL, *dMemBlock=NULL;
-			UINT cSize=0, dSize=0;
 
-			cSize=(UINT)cFile.tellg();
-			cFile.seekg(0, cFile.beg);
-			dSize=originalSize;
-			cMemBlock=new char [cSize];
-			dMemBlock=new char [dSize];
-			cFile.read(cMemBlock, cSize);
-			lzfx_decompress(cMemBlock, cSize, dMemBlock, &dSize);
-			dFile.write(dMemBlock, dSize);
-
-			delete [] cMemBlock;
-			delete [] dMemBlock;
-
-			dFile.close();
-		}
-		cFile.close();
-	}
-	
+	Decompression();
 	SetEvent(ghFinallyDone);
 
 	return 0;
@@ -345,32 +310,21 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 	HANDLE hWorkerEvent=it->second;
 
 	char * memBlock=NULL, *tmpBlock=NULL;
-	DWORD dwWaitResult;
 	UINT cChunkSize=0, oChunkSize=0, order=0;
 
 	while(1) {
-	//printf("Worker Thread %d waiting for write event...\n", GetCurrentThreadId());
-
-	dwWaitResult=WaitForSingleObject(
-		hDispatcherEvent,
-		INFINITE);
-
-	switch(dwWaitResult) {
-		case WAIT_OBJECT_0:
-			WaitForSingleObject(
-				ghInBufferMutex,
-				INFINITE);
-
-			if(!inBuffer.empty()) {
-				//printf("Worker Thread %d reading from buffer, got %c\n", GetCurrentThreadId(), inBuffer.front());
-				//memBlock=new char [cChunkSize];
-				//lzfx_compress((inBuffer.front()).first, (inBuffer.front()).second,memBlock, &cChunkSize);
-				tmpBlock=inBuffer.front().first.first;
-				oChunkSize=inBuffer.front().first.second;
-				cChunkSize=oChunkSize*2;
-				order=inBuffer.front().second;
-				//delete [] inBuffer.front().first;
-				inBuffer.erase(inBuffer.begin());
+		WaitForSingleObject(
+			hDispatcherEvent,
+			INFINITE);
+		WaitForSingleObject(
+			ghInBufferMutex,
+			INFINITE);
+		if(!inBuffer.empty()) {
+			tmpBlock=inBuffer.front().first.first;
+			oChunkSize=inBuffer.front().first.second;
+			cChunkSize=oChunkSize*2;
+			order=inBuffer.front().second;
+			inBuffer.erase(inBuffer.begin());
 			
 			ReleaseMutex(ghInBufferMutex);
 
@@ -383,20 +337,11 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 				INFINITE);
 			outBuffer.push_back(make_pair(make_pair(memBlock, cChunkSize), order));
 			ReleaseMutex(ghOutBufferMutex);
-			}
-			else
-				ReleaseMutex(ghInBufferMutex);
-
-			SetEvent(hWorkerEvent);
-			break;
-
-		default:
-			//printf("Wait error (%d)\n", GetLastError());
-			return 0;
+		}
+		else
+			ReleaseMutex(ghInBufferMutex);
+		SetEvent(hWorkerEvent);
 	}
-	}
-
-	//printf("Worker Thread %d exiting\n", GetCurrentThreadId());
 
 	return 0;
 }
@@ -404,53 +349,31 @@ DWORD WINAPI WorkerThreadProc(LPVOID lpParam) {
 DWORD WINAPI CollectorThreadProc(LPVOID lpParam) {
 	UNREFERENCED_PARAMETER(lpParam);
 	UINT i, j, k, end=0;
-	DWORD dwWaitResult;
 	ofstream desFile;
 
 	desFile.open(cFileName, ios::out|ios::binary);
 	if(desFile.is_open()) {
 		for(i=0; i<turns; i+=j) {
-			//printf("Collector Thread waiting for worker events...\n");
-
-			dwWaitResult=WaitForMultipleObjects(
+			WaitForMultipleObjects(
 				threadCount,
 				ghWorkerEvents,
 				TRUE,
 				INFINITE);
-
-			switch(dwWaitResult) {
-				case WAIT_OBJECT_0:
-					WaitForSingleObject(
-						ghOutBufferMutex,
-						INFINITE);
-					for(j=0; (j<threadCount)&&((j+i)<turns); j++) {
-						if(outBuffer.empty()) {
-							//printf("OHHHHHHHHHHHHHHHHHHHHHOHOHOH\n");
-							break;
-						}
-						//printf("Collector Thread reading from buffer, got %c\n", (outBuffer.front()).second);
-						for(k=0; outBuffer[k].second!=j; k++) ;
-						desFile.write(outBuffer[k].first.first, outBuffer[k].first.second);
-						delete [] outBuffer[k].first.first;
-						outBuffer.erase(outBuffer.begin()+k);
-					}
-					ReleaseMutex(ghOutBufferMutex);
+			for(j=0; (j<threadCount)&&((j+i)<turns); j++) {
+				if(outBuffer.empty())
 					break;
-
-				default:
-					printf("Wait error (%d)\n", GetLastError());
-					return 0;
+				for(k=0; outBuffer[k].second!=j; k++) ;
+				desFile.write(outBuffer[k].first.first, outBuffer[k].first.second);
+				delete [] outBuffer[k].first.first;
+				outBuffer.erase(outBuffer.begin()+k);
 			}
-
 			SetEvent(ghCollectorEvent);
 		}
-
 		desFile.close();
 	}
 	else
 		return 1;
 
-	//printf("Collector Thread exiting\n");
 	SetEvent(ghDecompressEvent);
 	WaitForSingleObject(
 		ghFinallyDone,
